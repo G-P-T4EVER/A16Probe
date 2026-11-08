@@ -5,9 +5,14 @@ DerivedData/
 build/
 *.xcuserstate
 *.xcuserdata/
+xcuserdata/
 *.ipa
 *.xcarchive
 
 # Local diagnostics
 *.log
 *.xcresult
+
+# Python validation
+__pycache__/
+*.pyc
