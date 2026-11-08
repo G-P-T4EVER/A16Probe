@@ -1,0 +1,13 @@
+# Xcode
+.DS_Store
+DerivedData/
+.build/
+build/
+*.xcuserstate
+*.xcuserdata/
+*.ipa
+*.xcarchive
+
+# Local diagnostics
+*.log
+*.xcresult
