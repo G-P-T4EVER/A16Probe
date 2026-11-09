@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import Darwin
 
 struct DiagnosticResult: Sendable {
     let text: String
@@ -28,9 +29,12 @@ struct DiagnosticRunner {
         let os = ProcessInfo.processInfo.operatingSystemVersion
         let assessment = Compatibility.assessment(
             machine: snapshot["hardwareIdentifier"] as? String ?? "unavailable",
+            build: snapshot["osBuild"] as? String ?? "unavailable",
             major: os.majorVersion, minor: os.minorVersion, patch: os.patchVersion,
             simulator: snapshot["simulator"] as? Bool ?? true)
-        event("compatibility", "Compared model and numeric OS version; beta designation and vulnerability remain unverified.")
+        event("compatibility", "Compared model, version and build against observations; beta release channel remains unverified.")
+        let filesystem = filesystemSnapshot()
+        event("filesystem", "Performed read-only open checks; no file content was read or changed.")
         let fm = FileManager.default
         let documents = try fm.url(for: .documentDirectory, in: .userDomainMask,
                                    appropriateFor: nil, create: true)
@@ -64,11 +68,12 @@ struct DiagnosticRunner {
             "application": ["version": bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown",
                             "build": bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"],
             "osVersion": "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)",
-            "runtime": snapshot, "compatibility": assessment, "events": events,
+            "runtime": snapshot, "filesystem": filesystem, "compatibility": assessment, "events": events,
             "reference": ["repository": "https://github.com/forcequitOS/worse_query",
                           "commit": "d1540e20cd82b974d891e0551ced6d6aeb570ac2"],
             "scope": ["systemFilesModified": false, "foreignContainersEnumerated": false,
                       "newPrivateLibrariesLoaded": false, "networkRequests": false,
+            "filesystemReadChecks": "open/close only; no file content or directory entries read",
                       "writes": "Only this application's A16ProbeReports directory",
                       "deviceTestConclusion": "No exploit attempted; no exploit success claim"]
         ]
@@ -77,4 +82,56 @@ struct DiagnosticRunner {
         logger.info("Report saved in application sandbox.")
         return DiagnosticResult(text: String(decoding: data, as: UTF8.self), file: file)
     }
+    // Observe the actual sandbox boundary through benign open/close calls only.
+    // An ENOENT result cannot distinguish a nonexistent path from a hidden one.
+    private static func filesystemSnapshot() -> [String: Any] {
+        let fm = FileManager.default
+        let documents = fm.urls(for: .documentDirectory, in: .userDomainMask).first
+        func check(_ name: String, _ path: String) -> [String: Any] {
+            let descriptor = path.withCString { Darwin.open($0, O_RDONLY | O_CLOEXEC) }
+            if descriptor >= 0 {
+                _ = Darwin.close(descriptor)
+                return ["name": name, "status": "openSucceeded", "errno": 0,
+                        "interpretation": "Handle opened; no file contents accessed."]
+            }
+            let code = errno
+            let detail = String(cString: strerror(code))
+            return ["name": name, "status": "openFailed", "errno": Int(code),
+                    "error": detail,
+                    "interpretation": code == ENOENT
+                        ? "Path missing or hidden; access cannot be inferred."
+                        : (code == EACCES || code == EPERM)
+                            ? "Open denied in this process context."
+                            : "No access conclusion from this error alone."]
+        }
+        var observations: [[String: Any]] = [
+            check("ownBundleDirectory", Bundle.main.bundleURL.path),
+            check("systemGroupDirectory", "/private/var/containers/Shared/SystemGroup"),
+            check("mobileGestaltCachePath",
+                  "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist")
+        ]
+        if let documents {
+            observations.insert(check("ownDocumentsDirectory", documents.path), at: 1)
+            let impossible = documents.appendingPathComponent("missing-a16probe-\\(UUID().uuidString)")
+            observations.append(check("missingFileControl", impossible.path))
+        }
+
+        // App Group access is meaningful only when a real group ID is configured
+        // and the signing profile actually grants its entitlement.
+        var groupInfo: [String: Any] = ["configured": false, "lookupPerformed": false,
+                                      "interpretation": "No group ID configured; do not treat this as a denial."]
+        if let identifier = Bundle.main.object(forInfoDictionaryKey: "A16ProbeAppGroupIdentifier") as? String,
+           !identifier.isEmpty {
+            let url = fm.containerURL(forSecurityApplicationGroupIdentifier: identifier)
+            groupInfo = ["configured": true, "lookupPerformed": true,
+                         "lookupSucceeded": url != nil,
+                         "interpretation": url == nil
+                             ? "No group URL returned; check signing entitlements before interpreting."
+                             : "Own App Group URL returned; not evidence of access to another group."]
+        }
+        return ["mode": "openCloseOnly", "paths": observations,
+                "appGroup": groupInfo,
+                "limits": "No filesystem enumeration, symlinks, private APIs or modification. Open success is not a sandbox escape."]
+    }
+
 }
