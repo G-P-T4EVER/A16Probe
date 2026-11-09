@@ -1,5 +1,6 @@
 import Foundation
 import OSLog
+import Darwin
 
 struct DiagnosticResult: Sendable {
     let text: String
@@ -28,9 +29,12 @@ struct DiagnosticRunner {
         let os = ProcessInfo.processInfo.operatingSystemVersion
         let assessment = Compatibility.assessment(
             machine: snapshot["hardwareIdentifier"] as? String ?? "unavailable",
+            build: snapshot["osBuild"] as? String ?? "unavailable",
             major: os.majorVersion, minor: os.minorVersion, patch: os.patchVersion,
             simulator: snapshot["simulator"] as? Bool ?? true)
-        event("compatibility", "Compared model and numeric OS version; beta designation and vulnerability remain unverified.")
+        event("compatibility", "Compared model, version and build against observations; beta release channel remains unverified.")
+        let filesystem = filesystemSnapshot()
+        event("filesystem", "Performed open/fstat/pread and O_WRONLY open-only check; no system file content modified.")
         let fm = FileManager.default
         let documents = try fm.url(for: .documentDirectory, in: .userDomainMask,
                                    appropriateFor: nil, create: true)
@@ -64,11 +68,12 @@ struct DiagnosticRunner {
             "application": ["version": bundle.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown",
                             "build": bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"],
             "osVersion": "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)",
-            "runtime": snapshot, "compatibility": assessment, "events": events,
+            "runtime": snapshot, "filesystem": filesystem, "compatibility": assessment, "events": events,
             "reference": ["repository": "https://github.com/forcequitOS/worse_query",
                           "commit": "d1540e20cd82b974d891e0551ced6d6aeb570ac2"],
             "scope": ["systemFilesModified": false, "foreignContainersEnumerated": false,
                       "newPrivateLibrariesLoaded": false, "networkRequests": false,
+            "filesystemReadChecks": "open/fstat; pread up to 16 bytes; O_WRONLY open-only without O_CREAT/O_TRUNC/write; no content exported or modified",
                       "writes": "Only this application's A16ProbeReports directory",
                       "deviceTestConclusion": "No exploit attempted; no exploit success claim"]
         ]
@@ -77,4 +82,113 @@ struct DiagnosticRunner {
         logger.info("Report saved in application sandbox.")
         return DiagnosticResult(text: String(decoding: data, as: UTF8.self), file: file)
     }
+    // Observe the actual sandbox boundary through benign open/close calls only.
+    // An ENOENT result cannot distinguish a nonexistent path from a hidden one.
+    private static func filesystemSnapshot() -> [String: Any] {
+        let fm = FileManager.default
+        let documents = fm.urls(for: .documentDirectory, in: .userDomainMask).first
+        func check(_ name: String, _ path: String) -> [String: Any] {
+            let descriptor = path.withCString { Darwin.open($0, O_RDONLY | O_CLOEXEC) }
+            if descriptor >= 0 {
+                var metadata = stat()
+                let metadataStatus = Darwin.fstat(descriptor, &metadata)
+                let metadataError = metadataStatus == 0 ? 0 : errno
+                if metadataStatus != 0 {
+                    _ = Darwin.close(descriptor)
+                    return ["name": name, "status": "openSucceeded", "errno": 0,
+                            "fstatStatus": "failed", "fstatErrno": Int(metadataError),
+                            "interpretation": "Handle opened but fstat failed; contents not read."]
+                }
+                let kind = metadata.st_mode & 0o170000
+                let fileType: String
+                switch kind {
+                case 0o100000: fileType = "regularFile"
+                case 0o040000: fileType = "directory"
+                case 0o120000: fileType = "symbolicLink"
+                default: fileType = "other"
+                }
+                var readProbe: [String: Any] = ["attempted": false]
+                if name == "mobileGestaltCachePath" && fileType == "regularFile" {
+                    // Read at most 16 bytes into ephemeral memory. Never include bytes in JSON or logs.
+                    var prefix = [UInt8](repeating: 0, count: 16)
+                    let count = prefix.withUnsafeMutableBytes { buffer in
+                        Darwin.pread(descriptor, buffer.baseAddress, buffer.count, 0)
+                    }
+                    if count >= 0 {
+                        readProbe = ["attempted": true, "status": "readSucceeded",
+                                     "bytesRead": Int(count), "contentExported": false]
+                    } else {
+                        let code = errno
+                        readProbe = ["attempted": true, "status": "readFailed",
+                                     "errno": Int(code), "error": String(cString: strerror(code)),
+                                     "contentExported": false]
+                    }
+                    prefix = [UInt8](repeating: 0, count: 16)
+                }
+                _ = Darwin.close(descriptor)
+                var writeOpenProbe: [String: Any] = ["attempted": false]
+                if name == "mobileGestaltCachePath" && fileType == "regularFile" {
+                    // O_WRONLY without O_CREAT, O_TRUNC or write/pwrite: checks open permission only.
+                    let writeDescriptor = path.withCString {
+                        Darwin.open($0, O_WRONLY | O_CLOEXEC | O_NOFOLLOW)
+                    }
+                    if writeDescriptor >= 0 {
+                        _ = Darwin.close(writeDescriptor)
+                        writeOpenProbe = ["attempted": true, "status": "writeOpenSucceeded",
+                                          "fileModified": false,
+                                          "interpretation": "Write-only descriptor opened; no writes attempted."]
+                    } else {
+                        let code = errno
+                        writeOpenProbe = ["attempted": true, "status": "writeOpenFailed",
+                                          "errno": Int(code), "error": String(cString: strerror(code)),
+                                          "fileModified": false,
+                                          "interpretation": "Write-only open was rejected; no writes attempted."]
+                    }
+                }
+                return ["name": name, "status": "openSucceeded", "errno": 0,
+                        "fstatStatus": "success", "fileType": fileType,
+                        "fileSizeBytes": Int64(metadata.st_size), "readProbe": readProbe,
+                        "writeOpenProbe": writeOpenProbe,
+                        "interpretation": "File opened for reading and inspected; write-open result is separate from actual modification."]
+            }
+            let code = errno
+            let detail = String(cString: strerror(code))
+            return ["name": name, "status": "openFailed", "errno": Int(code),
+                    "error": detail,
+                    "interpretation": code == ENOENT
+                        ? "Path missing or hidden; access cannot be inferred."
+                        : (code == EACCES || code == EPERM)
+                            ? "Open denied in this process context."
+                            : "No access conclusion from this error alone."]
+        }
+        var observations: [[String: Any]] = [
+            check("ownBundleDirectory", Bundle.main.bundleURL.path),
+            check("systemGroupDirectory", "/private/var/containers/Shared/SystemGroup"),
+            check("mobileGestaltCachePath",
+                  "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist")
+        ]
+        if let documents {
+            observations.insert(check("ownDocumentsDirectory", documents.path), at: 1)
+            let impossible = documents.appendingPathComponent("missing-a16probe-\(UUID().uuidString)")
+            observations.append(check("missingFileControl", impossible.path))
+        }
+
+        // App Group access is meaningful only when a real group ID is configured
+        // and the signing profile actually grants its entitlement.
+        var groupInfo: [String: Any] = ["configured": false, "lookupPerformed": false,
+                                      "interpretation": "No group ID configured; do not treat this as a denial."]
+        if let identifier = Bundle.main.object(forInfoDictionaryKey: "A16ProbeAppGroupIdentifier") as? String,
+           !identifier.isEmpty {
+            let url = fm.containerURL(forSecurityApplicationGroupIdentifier: identifier)
+            groupInfo = ["configured": true, "lookupPerformed": true,
+                         "lookupSucceeded": url != nil,
+                         "interpretation": url == nil
+                             ? "No group URL returned; check signing entitlements before interpreting."
+                             : "Own App Group URL returned; not evidence of access to another group."]
+        }
+        return ["mode": "openReadAndNonModifyingWriteOpen", "paths": observations,
+                "appGroup": groupInfo,
+                "limits": "No enumeration, symlinks, private APIs or system modification. Read or write-open success does not establish a sandbox escape."]
+    }
+
 }
