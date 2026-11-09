@@ -234,6 +234,20 @@ static NSDictionary *MCMRunDedicatedGroupTrial(NSString *targetDirectory, NSStri
         NSDictionary *attrs = [fm attributesOfItemAtPath:caches.path error:nil];
         BOOL cachesPresent = [fm fileExistsAtPath:caches.path];
         if (cachesPresent) {
+            NSDictionary *existing = [fm attributesOfItemAtPath:caches.path error:nil];
+            if ([existing[NSFileType] isEqual:NSFileTypeSymbolicLink]) {
+                NSString *dest = [fm destinationOfSymbolicLinkAtPath:caches.path error:nil];
+                if ([MCMCanonicalPath(dest) isEqualToString:targetDirectory]) {
+                    if (![fm removeItemAtURL:caches error:&error]) {
+                        summary[@"status"] = @"recoverySymlinkCleanupFailed";
+                        summary[@"error"] = error.localizedDescription ?: @"unknown";
+                        return summary;
+                    }
+                    cachesPresent = NO;
+                }
+            }
+        }
+        if (cachesPresent) {
             summary[@"status"] = @"recoveryConflictNeedsManualReview";
             return summary;
         }
