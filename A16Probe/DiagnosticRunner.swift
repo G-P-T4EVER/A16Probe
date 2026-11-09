@@ -27,7 +27,7 @@ struct DiagnosticRunner {
         var snapshot = ContainerProbe.snapshot()
         event("runtime", "Read hardware and OS build; inspected already-loaded symbols without invoking them.")
         let os = ProcessInfo.processInfo.operatingSystemVersion
-        let assessment = Compatibility.assessment(
+        var assessment = Compatibility.assessment(
             machine: snapshot["hardwareIdentifier"] as? String ?? "unavailable",
             build: snapshot["osBuild"] as? String ?? "unavailable",
             major: os.majorVersion, minor: os.minorVersion, patch: os.patchVersion,
@@ -39,7 +39,12 @@ struct DiagnosticRunner {
         if exploitTrial {
             snapshot["privateAPIsInvoked"] = true
             snapshot["containerQueriesSent"] = true
-            event("exploit", "Two explicit MCM sandbox-extension strategies attempted; no system writes performed.")
+            let strategies = trial["strategies"] as? [[String: Any]] ?? []
+            snapshot["sandboxExtensionsConsumed"] = strategies.contains { ($0["tokenConsumed"] as? Bool) == true }
+            snapshot["appGroupLookupPerformed"] = true
+            let verified = (trial["status"] as? String) == "sandboxEscapeVerified"
+            assessment["vulnerabilityStatus"] = verified ? "sandboxEscapeVerified" : "notVerifiedByTestedStrategies"
+            event("exploit", "MCM strategies evaluated with preflight; class 7 skipped if dedicated signed App Group unavailable. No system writes.")
         }
         let fm = FileManager.default
         let documents = try fm.url(for: .documentDirectory, in: .userDomainMask,

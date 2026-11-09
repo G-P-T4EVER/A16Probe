@@ -4,6 +4,8 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
+	<key>A16ProbeAppGroupIdentifier</key>
+	<string>group.org.a16probe.research</string>
 	<key>CFBundleDisplayName</key>
 	<string>A16Probe</string>
 	<key>CFBundleExecutable</key>

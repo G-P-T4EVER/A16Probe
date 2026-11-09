@@ -54,7 +54,7 @@ struct ContentView: View {
                     if model.running { ProgressView() }
                 }
                 Section("Проверка sandbox escape · экспериментально") {
-                    Text("Два независимых способа запроса sandbox extension через ContainerManager: geod (class 12) и прямой запрос MobileGestalt (class 13). Это настоящие попытки получить разрешение, а не поиск символов.")
+                    Text("Три варианта ContainerManager: geod (class 12), прямой MobileGestalt (class 13) и отдельная App Group (class 7). Для class 7 нужен разрешённый профиль подписи с группой group.org.a16probe.research. Без него тест будет пропущен.")
                         .font(.footnote)
                     Text("Тест не меняет системные файлы и не записывает ни одного байта. Используются приватные API: на неподдерживаемой бете приложение может закрыться.")
                         .font(.footnote).foregroundStyle(.secondary)
