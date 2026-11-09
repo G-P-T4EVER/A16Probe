@@ -10,7 +10,7 @@ struct DiagnosticResult: Sendable {
 struct DiagnosticRunner {
     private static let logger = Logger(subsystem: "org.a16probe.research", category: "diagnostics")
 
-    static func run() throws -> DiagnosticResult {
+    static func run(exploitTrial: Bool = false) throws -> DiagnosticResult {
         let runID = UUID().uuidString
         let started = Date()
         let clock = ProcessInfo.processInfo.systemUptime
@@ -24,7 +24,7 @@ struct DiagnosticRunner {
             logger.info("\(phase, privacy: .public): \(message, privacy: .public)")
         }
         event("start", "Observation-only diagnostics started.")
-        let snapshot = ContainerProbe.snapshot()
+        var snapshot = ContainerProbe.snapshot()
         event("runtime", "Read hardware and OS build; inspected already-loaded symbols without invoking them.")
         let os = ProcessInfo.processInfo.operatingSystemVersion
         let assessment = Compatibility.assessment(
@@ -35,6 +35,12 @@ struct DiagnosticRunner {
         event("compatibility", "Compared model, version and build against observations; beta release channel remains unverified.")
         let filesystem = filesystemSnapshot()
         event("filesystem", "Performed open/fstat/pread and O_WRONLY open-only check; no system file content modified.")
+        let trial: [String: Any] = exploitTrial ? ContainerProbe.runEscapeTrial() : ["status": "notRequested"]
+        if exploitTrial {
+            snapshot["privateAPIsInvoked"] = true
+            snapshot["containerQueriesSent"] = true
+            event("exploit", "Two explicit MCM sandbox-extension strategies attempted; no system writes performed.")
+        }
         let fm = FileManager.default
         let documents = try fm.url(for: .documentDirectory, in: .userDomainMask,
                                    appropriateFor: nil, create: true)
@@ -69,13 +75,18 @@ struct DiagnosticRunner {
                             "build": bundle.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"],
             "osVersion": "\(os.majorVersion).\(os.minorVersion).\(os.patchVersion)",
             "runtime": snapshot, "filesystem": filesystem, "compatibility": assessment, "events": events,
+            "sandboxEscapeTrial": trial,
             "reference": ["repository": "https://github.com/forcequitOS/worse_query",
                           "commit": "d1540e20cd82b974d891e0551ced6d6aeb570ac2"],
+            "exploitResearchSources": [
+                "https://github.com/0xjohnnydev/Geod-MCM-PoC",
+                "https://github.com/murk-sus/kamui-escape"
+            ],
             "scope": ["systemFilesModified": false, "foreignContainersEnumerated": false,
                       "newPrivateLibrariesLoaded": false, "networkRequests": false,
             "filesystemReadChecks": "open/fstat; pread up to 16 bytes; O_WRONLY open-only without O_CREAT/O_TRUNC/write; no content exported or modified",
                       "writes": "Only this application's A16ProbeReports directory",
-                      "deviceTestConclusion": "No exploit attempted; no exploit success claim"]
+                      "deviceTestConclusion": exploitTrial ? "MCM query trial attempted; success only if denied->allowed->denied write-open proved" : "Exploit trial not requested"]
         ]
         let data = try JSONSerialization.data(withJSONObject: report, options: [.prettyPrinted, .sortedKeys])
         try data.write(to: file, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
