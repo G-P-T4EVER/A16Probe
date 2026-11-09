@@ -34,7 +34,7 @@ struct DiagnosticRunner {
             simulator: snapshot["simulator"] as? Bool ?? true)
         event("compatibility", "Compared model, version and build against observations; beta release channel remains unverified.")
         let filesystem = filesystemSnapshot()
-        event("filesystem", "Performed read-only open/fstat and bounded pread check; no file content saved or logged.")
+        event("filesystem", "Performed open/fstat/pread and O_WRONLY open-only check; no system file content modified.")
         let fm = FileManager.default
         let documents = try fm.url(for: .documentDirectory, in: .userDomainMask,
                                    appropriateFor: nil, create: true)
@@ -73,7 +73,7 @@ struct DiagnosticRunner {
                           "commit": "d1540e20cd82b974d891e0551ced6d6aeb570ac2"],
             "scope": ["systemFilesModified": false, "foreignContainersEnumerated": false,
                       "newPrivateLibrariesLoaded": false, "networkRequests": false,
-            "filesystemReadChecks": "open/fstat; pread up to 16 bytes only from the MobileGestalt cache; no content exported",
+            "filesystemReadChecks": "open/fstat; pread up to 16 bytes; O_WRONLY open-only without O_CREAT/O_TRUNC/write; no content exported or modified",
                       "writes": "Only this application's A16ProbeReports directory",
                       "deviceTestConclusion": "No exploit attempted; no exploit success claim"]
         ]
@@ -126,10 +126,30 @@ struct DiagnosticRunner {
                     prefix = [UInt8](repeating: 0, count: 16)
                 }
                 _ = Darwin.close(descriptor)
+                var writeOpenProbe: [String: Any] = ["attempted": false]
+                if name == "mobileGestaltCachePath" && fileType == "regularFile" {
+                    // O_WRONLY without O_CREAT, O_TRUNC or write/pwrite: checks open permission only.
+                    let writeDescriptor = path.withCString {
+                        Darwin.open($0, O_WRONLY | O_CLOEXEC | O_NOFOLLOW)
+                    }
+                    if writeDescriptor >= 0 {
+                        _ = Darwin.close(writeDescriptor)
+                        writeOpenProbe = ["attempted": true, "status": "writeOpenSucceeded",
+                                          "fileModified": false,
+                                          "interpretation": "Write-only descriptor opened; no writes attempted."]
+                    } else {
+                        let code = errno
+                        writeOpenProbe = ["attempted": true, "status": "writeOpenFailed",
+                                          "errno": Int(code), "error": String(cString: strerror(code)),
+                                          "fileModified": false,
+                                          "interpretation": "Write-only open was rejected; no writes attempted."]
+                    }
+                }
                 return ["name": name, "status": "openSucceeded", "errno": 0,
                         "fstatStatus": "success", "fileType": fileType,
                         "fileSizeBytes": Int64(metadata.st_size), "readProbe": readProbe,
-                        "interpretation": "Opened descriptor and inspected type. Read result does not establish sandbox escape."]
+                        "writeOpenProbe": writeOpenProbe,
+                        "interpretation": "File opened for reading and inspected; write-open result is separate from actual modification."]
             }
             let code = errno
             let detail = String(cString: strerror(code))
@@ -166,9 +186,9 @@ struct DiagnosticRunner {
                              ? "No group URL returned; check signing entitlements before interpreting."
                              : "Own App Group URL returned; not evidence of access to another group."]
         }
-        return ["mode": "readOnlyOpenFstatAndBoundedPread", "paths": observations,
+        return ["mode": "openReadAndNonModifyingWriteOpen", "paths": observations,
                 "appGroup": groupInfo,
-                "limits": "No enumeration, symlinks, private APIs or modification. Read success does not establish a sandbox escape."]
+                "limits": "No enumeration, symlinks, private APIs or system modification. Read or write-open success does not establish a sandbox escape."]
     }
 
 }
