@@ -112,7 +112,7 @@ struct DiagnosticRunner {
         ]
         if let documents {
             observations.insert(check("ownDocumentsDirectory", documents.path), at: 1)
-            let impossible = documents.appendingPathComponent("missing-a16probe-\\(UUID().uuidString)")
+            let impossible = documents.appendingPathComponent("missing-a16probe-\(UUID().uuidString)")
             observations.append(check("missingFileControl", impossible.path))
         }
 
