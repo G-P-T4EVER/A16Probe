@@ -34,7 +34,7 @@ struct DiagnosticRunner {
             simulator: snapshot["simulator"] as? Bool ?? true)
         event("compatibility", "Compared model, version and build against observations; beta release channel remains unverified.")
         let filesystem = filesystemSnapshot()
-        event("filesystem", "Performed read-only open checks; no file content was read or changed.")
+        event("filesystem", "Performed read-only open/fstat and bounded pread check; no file content saved or logged.")
         let fm = FileManager.default
         let documents = try fm.url(for: .documentDirectory, in: .userDomainMask,
                                    appropriateFor: nil, create: true)
@@ -73,7 +73,7 @@ struct DiagnosticRunner {
                           "commit": "d1540e20cd82b974d891e0551ced6d6aeb570ac2"],
             "scope": ["systemFilesModified": false, "foreignContainersEnumerated": false,
                       "newPrivateLibrariesLoaded": false, "networkRequests": false,
-            "filesystemReadChecks": "open/close only; no file content or directory entries read",
+            "filesystemReadChecks": "open/fstat; pread up to 16 bytes only from the MobileGestalt cache; no content exported",
                       "writes": "Only this application's A16ProbeReports directory",
                       "deviceTestConclusion": "No exploit attempted; no exploit success claim"]
         ]
@@ -93,8 +93,8 @@ struct DiagnosticRunner {
                 var metadata = stat()
                 let metadataStatus = Darwin.fstat(descriptor, &metadata)
                 let metadataError = metadataStatus == 0 ? 0 : errno
-                _ = Darwin.close(descriptor)
                 if metadataStatus != 0 {
+                    _ = Darwin.close(descriptor)
                     return ["name": name, "status": "openSucceeded", "errno": 0,
                             "fstatStatus": "failed", "fstatErrno": Int(metadataError),
                             "interpretation": "Handle opened but fstat failed; contents not read."]
@@ -107,10 +107,29 @@ struct DiagnosticRunner {
                 case 0o120000: fileType = "symbolicLink"
                 default: fileType = "other"
                 }
+                var readProbe: [String: Any] = ["attempted": false]
+                if name == "mobileGestaltCachePath" && fileType == "regularFile" {
+                    // Read at most 16 bytes into ephemeral memory. Never include bytes in JSON or logs.
+                    var prefix = [UInt8](repeating: 0, count: 16)
+                    let count = prefix.withUnsafeMutableBytes { buffer in
+                        Darwin.pread(descriptor, buffer.baseAddress, buffer.count, 0)
+                    }
+                    if count >= 0 {
+                        readProbe = ["attempted": true, "status": "readSucceeded",
+                                     "bytesRead": Int(count), "contentExported": false]
+                    } else {
+                        let code = errno
+                        readProbe = ["attempted": true, "status": "readFailed",
+                                     "errno": Int(code), "error": String(cString: strerror(code)),
+                                     "contentExported": false]
+                    }
+                    prefix = [UInt8](repeating: 0, count: 16)
+                }
+                _ = Darwin.close(descriptor)
                 return ["name": name, "status": "openSucceeded", "errno": 0,
                         "fstatStatus": "success", "fileType": fileType,
-                        "fileSizeBytes": Int64(metadata.st_size),
-                        "interpretation": "File type verified via open descriptor; content not read."]
+                        "fileSizeBytes": Int64(metadata.st_size), "readProbe": readProbe,
+                        "interpretation": "Opened descriptor and inspected type. Read result does not establish sandbox escape."]
             }
             let code = errno
             let detail = String(cString: strerror(code))
@@ -147,9 +166,9 @@ struct DiagnosticRunner {
                              ? "No group URL returned; check signing entitlements before interpreting."
                              : "Own App Group URL returned; not evidence of access to another group."]
         }
-        return ["mode": "openCloseOnly", "paths": observations,
+        return ["mode": "readOnlyOpenFstatAndBoundedPread", "paths": observations,
                 "appGroup": groupInfo,
-                "limits": "No filesystem enumeration, symlinks, private APIs or modification. Open success is not a sandbox escape."]
+                "limits": "No enumeration, symlinks, private APIs or modification. Read success does not establish a sandbox escape."]
     }
 
 }
