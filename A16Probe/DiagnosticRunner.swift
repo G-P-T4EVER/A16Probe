@@ -90,9 +90,27 @@ struct DiagnosticRunner {
         func check(_ name: String, _ path: String) -> [String: Any] {
             let descriptor = path.withCString { Darwin.open($0, O_RDONLY | O_CLOEXEC) }
             if descriptor >= 0 {
+                var metadata = stat()
+                let metadataStatus = Darwin.fstat(descriptor, &metadata)
+                let metadataError = metadataStatus == 0 ? 0 : errno
                 _ = Darwin.close(descriptor)
+                if metadataStatus != 0 {
+                    return ["name": name, "status": "openSucceeded", "errno": 0,
+                            "fstatStatus": "failed", "fstatErrno": Int(metadataError),
+                            "interpretation": "Handle opened but fstat failed; contents not read."]
+                }
+                let kind = metadata.st_mode & 0o170000
+                let fileType: String
+                switch kind {
+                case 0o100000: fileType = "regularFile"
+                case 0o040000: fileType = "directory"
+                case 0o120000: fileType = "symbolicLink"
+                default: fileType = "other"
+                }
                 return ["name": name, "status": "openSucceeded", "errno": 0,
-                        "interpretation": "Handle opened; no file contents accessed."]
+                        "fstatStatus": "success", "fileType": fileType,
+                        "fileSizeBytes": Int64(metadata.st_size),
+                        "interpretation": "File type verified via open descriptor; content not read."]
             }
             let code = errno
             let detail = String(cString: strerror(code))
