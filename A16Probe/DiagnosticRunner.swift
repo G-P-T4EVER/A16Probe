@@ -39,7 +39,7 @@ struct DiagnosticRunner {
         if exploitTrial {
             snapshot["privateAPIsInvoked"] = true
             snapshot["containerQueriesSent"] = true
-            event("exploit", "Two explicit MCM sandbox-extension strategies attempted; no system writes performed.")
+            event("exploit", "MCM strategies evaluated with preflight; class 7 skipped if dedicated signed App Group unavailable. No system writes.")
         }
         let fm = FileManager.default
         let documents = try fm.url(for: .documentDirectory, in: .userDomainMask,
